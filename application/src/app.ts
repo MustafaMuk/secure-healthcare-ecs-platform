@@ -6,6 +6,7 @@ import express, {
 import helmet from "helmet";
 
 import { config } from "./config.js";
+import { appointmentRouter } from "./appointments.js";
 import { checkDatabase } from "./database.js";
 
 export const app = express();
@@ -24,6 +25,7 @@ const requestContext: RequestHandler = (request, response, next) => {
 
   const startedAt = performance.now();
 
+  response.locals.correlationId = correlationId;
   response.setHeader("x-correlation-id", correlationId);
 
   response.on("finish", () => {
@@ -95,6 +97,8 @@ app.get("/health/ready", async (_request, response) => {
     });
   }
 });
+
+app.use("/api/appointments", appointmentRouter);
 
 app.get("/version", (_request, response) => {
   response.status(200).json({

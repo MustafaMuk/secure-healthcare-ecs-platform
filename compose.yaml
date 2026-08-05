@@ -1,0 +1,26 @@
+services:
+  database:
+    image: postgres:17-alpine
+    container_name: careflow-database
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: careflow
+      POSTGRES_USER: careflow
+      POSTGRES_PASSWORD: careflow_dev
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - careflow_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U careflow -d careflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  careflow_postgres_data:

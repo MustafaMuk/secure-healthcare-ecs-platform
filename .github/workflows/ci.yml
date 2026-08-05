@@ -1,0 +1,98 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-and-scan:
+    name: Test, build and validate
+
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+
+        env:
+          POSTGRES_DB: careflow
+          POSTGRES_USER: careflow
+          POSTGRES_PASSWORD: careflow_ci
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd
+          "pg_isready -U careflow -d careflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      PORT: 3100
+      APP_VERSION: ci-${{ github.sha }}
+      DATABASE_URL: postgresql://careflow:careflow_ci@127.0.0.1:5432/careflow
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v6
+
+      - name: Configure Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.1
+          cache: npm
+          cache-dependency-path: application/package-lock.json
+
+      - name: Install application dependencies
+        working-directory: application
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: application
+        run: npm test
+
+      - name: Compile TypeScript
+        working-directory: application
+        run: npm run build
+
+      - name: Apply database migrations
+        working-directory: application
+        run: npm run db:migrate
+
+      - name: Run end-to-end smoke test
+        run: ./scripts/smoke-test.sh
+
+      - name: Build hardened container image
+        working-directory: application
+        run: |
+          docker build \
+            --tag "careflow-api:${GITHUB_SHA}" \
+            .
+
+      - name: Inspect container image
+        run: |
+          docker image inspect \
+            "careflow-api:${GITHUB_SHA}" \
+            --format \
+            'Image={{.RepoTags}} Size={{.Size}} User={{.Config.User}}'
+
+          IMAGE_USER=$(
+            docker image inspect \
+              "careflow-api:${GITHUB_SHA}" \
+              --format '{{.Config.User}}'
+          )
+
+          test "${IMAGE_USER}" = "node"

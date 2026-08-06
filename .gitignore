@@ -35,3 +35,7 @@ evidence/raw/
 
 # Local troubleshooting output
 diagnostics/
+
+# Public AWS RDS certificate authority bundle
+!application/certs/
+!application/certs/global-bundle.pem

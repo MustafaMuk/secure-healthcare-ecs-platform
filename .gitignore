@@ -29,3 +29,6 @@ Thumbs.db
 
 # Evidence containing temporary outputs
 evidence/raw/
+
+# Local Terraform backend configuration
+**/backend.hcl

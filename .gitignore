@@ -32,3 +32,6 @@ evidence/raw/
 
 # Local Terraform backend configuration
 **/backend.hcl
+
+# Local troubleshooting output
+diagnostics/

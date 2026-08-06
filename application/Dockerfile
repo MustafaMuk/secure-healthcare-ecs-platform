@@ -10,7 +10,7 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 
-RUN npm test
+RUN DATABASE_URL="postgresql://careflow:careflow_test@127.0.0.1:5432/careflow" DB_SSL=false npm test
 RUN npm run build
 RUN npm prune --omit=dev
 
@@ -25,6 +25,7 @@ WORKDIR /app
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node migrations ./migrations
+COPY --chown=node:node certs ./certs
 COPY --chown=node:node package.json ./
 
 USER node

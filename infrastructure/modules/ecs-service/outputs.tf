@@ -32,3 +32,8 @@ output "application_log_group_name" {
   description = "CloudWatch log group used by the application."
   value       = aws_cloudwatch_log_group.application.name
 }
+
+output "service_arn" {
+  description = "ARN of the CareFlow ECS service."
+  value       = aws_ecs_service.application.arn
+}

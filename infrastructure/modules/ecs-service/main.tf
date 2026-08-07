@@ -291,7 +291,8 @@ resource "aws_ecs_service" "application" {
     # Allows later CLI or autoscaling changes without Terraform
     # resetting the running-task count to zero.
     ignore_changes = [
-      desired_count
+      desired_count,
+      task_definition
     ]
   }
 

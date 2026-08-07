@@ -1,0 +1,331 @@
+name: Continuous Deployment
+
+on:
+  workflow_run:
+    workflows:
+      - Continuous Integration
+    types:
+      - completed
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: careflow-production-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+
+  ECR_REPOSITORY: careflow/dev/careflow-api
+
+  ECS_CLUSTER: careflow-dev-cluster
+  ECS_SERVICE: careflow-dev-careflow-api
+  ECS_TASK_FAMILY: careflow-dev-careflow-api
+
+  CONTAINER_NAME: careflow-api
+
+jobs:
+  deploy:
+    name: Build, scan and deploy to ECS
+
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 25
+
+    steps:
+      - name: Resolve tested commit
+        id: release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RELEASE_SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            RELEASE_SHA="${GITHUB_SHA}"
+          fi
+
+          test -n "$RELEASE_SHA"
+
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+          echo "Deploying tested commit: $RELEASE_SHA"
+
+      - name: Check out tested source code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+
+      - name: Configure temporary AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: CareFlow-${{ github.run_id }}
+
+      - name: Verify AWS workload identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== OIDC authenticated identity ==="
+
+          aws sts get-caller-identity \
+            --query '{
+              Account:Account,
+              Arn:Arn
+            }' \
+            --output table
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build application image
+        id: image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.release.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "=== Building immutable release ==="
+          echo "Release: ${IMAGE_TAG}"
+
+          docker build \
+            --pull \
+            --tag "$IMAGE_URI" \
+            application
+
+          echo "=== Local image inspection ==="
+
+          docker image inspect "$IMAGE_URI" \
+            --format 'User={{.Config.User}} Size={{.Size}}'
+
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Push application image to ECR
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+
+          docker push "$IMAGE_URI"
+
+          echo
+          echo "Published:"
+          echo "$IMAGE_URI"
+
+      - name: Wait for ECR vulnerability scan
+        id: scan
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Waiting for ECR vulnerability scan ==="
+
+          SCAN_COMPLETE=false
+
+          for attempt in $(seq 1 30)
+          do
+            SCAN_STATUS="$(
+              aws ecr describe-image-scan-findings \
+                --repository-name "$ECR_REPOSITORY" \
+                --image-id "imageTag=${IMAGE_TAG}" \
+                --query 'imageScanStatus.status' \
+                --output text \
+                2>/dev/null || true
+            )"
+
+            echo "Attempt ${attempt}/30: ${SCAN_STATUS:-not-started}"
+
+            if [ "$SCAN_STATUS" = "COMPLETE" ]; then
+              SCAN_COMPLETE=true
+              break
+            fi
+
+            if [ "$SCAN_STATUS" = "FAILED" ]; then
+              echo "STOP: ECR vulnerability scan failed."
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ "$SCAN_COMPLETE" != "true" ]; then
+            echo "STOP: ECR scan did not complete within expected time."
+            exit 1
+          fi
+
+          aws ecr describe-image-scan-findings \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-id "imageTag=${IMAGE_TAG}" \
+            --output json \
+            > /tmp/ecr-scan.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(
+              Path("/tmp/ecr-scan.json").read_text()
+          )
+
+          findings = (
+              result
+              .get("imageScanFindings", {})
+              .get("findingSeverityCounts", {})
+          )
+
+          critical = int(findings.get("CRITICAL", 0))
+          high = int(findings.get("HIGH", 0))
+          medium = int(findings.get("MEDIUM", 0))
+          low = int(findings.get("LOW", 0))
+
+          print()
+          print("=== ECR vulnerability summary ===")
+          print(f"CRITICAL: {critical}")
+          print(f"HIGH:     {high}")
+          print(f"MEDIUM:   {medium}")
+          print(f"LOW:      {low}")
+
+          if critical > 0 or high > 0:
+              raise SystemExit(
+                  "STOP: release contains HIGH or CRITICAL findings."
+              )
+
+          print()
+          print("Container security gate: PASSED")
+          PY
+
+      - name: Render new ECS task definition
+        id: task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1.8.5
+        with:
+          task-definition-family: ${{ env.ECS_TASK_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.image }}
+          environment-variables: |
+            APP_VERSION=${{ steps.release.outputs.sha }}
+
+      - name: Deploy release to Amazon ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-definition.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+
+      - name: Verify deployed ECS service
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== ECS deployment result ==="
+
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{
+              Status:status,
+              Desired:desiredCount,
+              Running:runningCount,
+              Pending:pendingCount,
+              TaskDefinition:taskDefinition,
+              Rollout:deployments[0].rolloutState
+            }' \
+            --output table
+
+          RUNNING="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].runningCount' \
+              --output text
+          )"
+
+          PENDING="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].pendingCount' \
+              --output text
+          )"
+
+          ROLLOUT="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[0].rolloutState' \
+              --output text
+          )"
+
+          if [ "$RUNNING" -lt 1 ]; then
+            echo "STOP: ECS has no running application task."
+            exit 1
+          fi
+
+          if [ "$PENDING" != "0" ]; then
+            echo "STOP: ECS deployment still has pending tasks."
+            exit 1
+          fi
+
+          if [ "$ROLLOUT" != "COMPLETED" ]; then
+            echo "STOP: ECS rollout is not complete."
+            exit 1
+          fi
+
+          echo
+          echo "CareFlow ECS deployment: SUCCESS"
+          echo "Release: ${EXPECTED_SHA}"
+
+      - name: Deployment summary
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          IMAGE_URI: ${{ steps.image.outputs.image }}
+        run: |
+          {
+            echo "# CareFlow AWS Deployment"
+            echo
+            echo "✅ OIDC authentication succeeded"
+            echo
+            echo "✅ Immutable ECR image published"
+            echo
+            echo "✅ ECR vulnerability security gate passed"
+            echo
+            echo "✅ ECS task definition registered"
+            echo
+            echo "✅ ECS service reached stable state"
+            echo
+            echo "**Release:** \`${RELEASE_SHA}\`"
+            echo
+            echo "**Image:** \`${IMAGE_URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

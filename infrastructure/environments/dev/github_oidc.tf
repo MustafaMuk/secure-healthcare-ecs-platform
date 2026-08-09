@@ -8,6 +8,14 @@ module "github_oidc" {
     "repo:MustafaMuk@1904111277/secure-healthcare-ecs-platform@1324415864:ref:refs/heads/main"
   )
 
+  github_repository = (
+    "MustafaMuk/secure-healthcare-ecs-platform"
+  )
+
+  github_repository_id       = "1324415864"
+  github_repository_owner_id = "1904111277"
+  github_ref                 = "refs/heads/main"
+
   ecr_repository_arn = (
     module.container_registry.repository_arn
   )

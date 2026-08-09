@@ -46,18 +46,58 @@ data "aws_iam_policy_document" "github_assume_role" {
     }
 
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
 
       values = [
-        var.github_subject
+        replace(
+          var.github_subject,
+          ":ref:${var.github_ref}",
+          ":*"
+        )
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository"
+
+      values = [
+        var.github_repository
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository_id"
+
+      values = [
+        var.github_repository_id
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository_owner_id"
+
+      values = [
+        var.github_repository_owner_id
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:ref"
+
+      values = [
+        var.github_ref
       ]
     }
   }
 }
 
 resource "aws_iam_role" "github_deploy" {
-  name = "${local.name_prefix}-github-deploy-role"
+  name = "${local.name_prefix}-cd-role"
 
   description = (
     "Temporary deployment identity for the CareFlow GitHub Actions workflow."
@@ -70,7 +110,7 @@ resource "aws_iam_role" "github_deploy" {
   max_session_duration = 3600
 
   tags = merge(local.common_tags, {
-    Name    = "${local.name_prefix}-github-deploy-role"
+    Name    = "${local.name_prefix}-cd-role"
     Purpose = "OIDC authenticated application deployment"
   })
 }
@@ -113,7 +153,8 @@ data "aws_iam_policy_document" "github_deploy" {
 
     actions = [
       "ecs:DescribeTaskDefinition",
-      "ecs:RegisterTaskDefinition"
+      "ecs:RegisterTaskDefinition",
+      "ecs:TagResource"
     ]
 
     resources = ["*"]

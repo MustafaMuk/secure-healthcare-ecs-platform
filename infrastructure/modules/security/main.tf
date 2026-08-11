@@ -9,6 +9,12 @@ locals {
   }
 }
 
+# AWS-managed list of CloudFront origin-facing IPv4 addresses.
+# AWS maintains this list automatically.
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
 resource "aws_security_group" "load_balancer" {
   name_prefix = "${local.name_prefix}-alb-"
   description = "Controls public traffic reaching the CareFlow ALB."
@@ -61,18 +67,23 @@ resource "aws_security_group" "vpc_endpoints" {
   })
 }
 
+
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   security_group_id = aws_security_group.load_balancer.id
 
-  description = "Permit public HTTP traffic during the initial deployment."
+  description = "Permit HTTP origin traffic only from CloudFront."
 
-  cidr_ipv4   = "0.0.0.0/0"
-  ip_protocol = "tcp"
-  from_port   = 80
-  to_port     = 80
+  prefix_list_id = data.aws_ec2_managed_prefix_list.cloudfront.id
+  ip_protocol    = "tcp"
+  from_port      = 80
+  to_port        = 80
+
+  lifecycle {
+    create_before_destroy = true
+  }
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-alb-http-ingress"
+    Name = "${local.name_prefix}-cloudfront-to-alb"
   })
 }
 

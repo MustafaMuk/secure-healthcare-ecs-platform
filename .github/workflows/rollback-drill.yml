@@ -1,0 +1,208 @@
+name: ECS Rollback Drill
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type RUN_ROLLBACK_DRILL to confirm"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: careflow-rollback-drill
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+  ECS_CLUSTER: careflow-dev-cluster
+  ECS_SERVICE: careflow-dev-careflow-api
+  ECS_TASK_FAMILY: careflow-dev-careflow-api
+  CONTAINER_NAME: careflow-api
+
+jobs:
+  rollback-drill:
+    name: Controlled failure and automatic rollback
+    if: ${{ inputs.confirm == 'RUN_ROLLBACK_DRILL' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: RollbackDrill-${{ github.run_id }}
+          allowed-account-ids: 943939515134
+
+      - name: Capture healthy baseline
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TASK_DEFINITION="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          IMAGE="$(
+            aws ecs describe-task-definition \
+              --task-definition "$TASK_DEFINITION" \
+              --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
+              --output text
+          )"
+
+          echo "task_definition=$TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Healthy baseline:"
+          echo "$TASK_DEFINITION"
+
+      - name: Render deliberately unhealthy task definition
+        id: broken-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-arn: ${{ steps.baseline.outputs.task_definition }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.baseline.outputs.image }}
+          environment-variables: |
+            PORT=3999
+            APP_VERSION=rollback-drill-${{ github.run_id }}
+
+      - name: Deploy unhealthy revision
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.broken-task.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: false
+          max-retries: 0
+
+      - name: Record broken revision
+        id: broken
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BROKEN_TASK_DEFINITION="$(
+            aws ecs describe-task-definition \
+              --task-definition "$ECS_TASK_FAMILY" \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          )"
+
+          echo "task_definition=$BROKEN_TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+
+          echo "Unhealthy revision:"
+          echo "$BROKEN_TASK_DEFINITION"
+
+      - name: Wait for ECS automatic rollback
+        id: rollback
+        shell: bash
+        env:
+          BASELINE: ${{ steps.baseline.outputs.task_definition }}
+          BROKEN: ${{ steps.broken.outputs.task_definition }}
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for ECS deployment circuit breaker..."
+
+          for attempt in $(seq 1 90); do
+            PRIMARY="$(
+              aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" \
+                --output text
+            )"
+
+            RUNNING="$(
+              aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --query 'services[0].runningCount' \
+                --output text
+            )"
+
+            PENDING="$(
+              aws ecs describe-services \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --query 'services[0].pendingCount' \
+                --output text
+            )"
+
+            echo "Attempt $attempt: running=$RUNNING pending=$PENDING"
+            echo "Primary: $PRIMARY"
+
+            if [ "$PRIMARY" = "$BASELINE" ] &&
+               [ "$RUNNING" -ge 1 ] &&
+               [ "$PENDING" -eq 0 ]; then
+
+              echo "rollback_verified=true" >> "$GITHUB_OUTPUT"
+              echo "Automatic rollback verified."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Rollback was not verified within the expected time."
+          exit 1
+
+      - name: Show ECS deployment evidence
+        if: always()
+        shell: bash
+        run: |
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{
+              TaskDefinition:taskDefinition,
+              Desired:desiredCount,
+              Running:runningCount,
+              Pending:pendingCount,
+              RecentEvents:events[0:8].[createdAt,message]
+            }' \
+            --output json
+
+      - name: Verify public service health
+        shell: bash
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            "${{ vars.CAREFLOW_PUBLIC_URL }}/health/ready"
+
+      - name: Publish rollback drill summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# CareFlow ECS Rollback Drill"
+            echo
+            echo "### Fault injection"
+            echo "Application PORT changed from **3000 → 3999**."
+            echo
+            echo "### Healthy baseline"
+            echo "\`${{ steps.baseline.outputs.task_definition }}\`"
+            echo
+            echo "### Broken revision"
+            echo "\`${{ steps.broken.outputs.task_definition }}\`"
+            echo
+            echo "### Result"
+            echo "Automatic rollback: **${{ steps.rollback.outcome }}**"
+            echo
+            echo "Public endpoint: **${{ vars.CAREFLOW_PUBLIC_URL }}**"
+            echo
+            echo "ECS deployment circuit breaker protected the running service from an unhealthy release."
+          } >> "$GITHUB_STEP_SUMMARY"

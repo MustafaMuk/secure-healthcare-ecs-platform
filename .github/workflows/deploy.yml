@@ -1,11 +1,21 @@
-name: Simple ECS Deployment
+name: Continuous Deployment
 
 on:
+  workflow_run:
+    workflows:
+      - Continuous Integration
+    types:
+      - completed
+
   workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
+
+concurrency:
+  group: careflow-dev-deployment
+  cancel-in-progress: false
 
 env:
   AWS_REGION: eu-west-2
@@ -19,15 +29,35 @@ env:
 
 jobs:
   deploy:
-    name: Deploy CareFlow to ECS
+    name: Build, scan and deploy to ECS
+
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
     steps:
-      - name: Checkout source
+      - name: Checkout tested source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_SHA }}
 
       - name: Authenticate to AWS using OIDC
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -41,13 +71,50 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and push image
+      - name: Build and push application image
         uses: docker/build-push-action@v7
         with:
           context: ./application
           push: true
-          tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}-${{ github.run_id }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check ECR vulnerability scan
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Amazon ECR image scan..."
+
+          aws ecr wait image-scan-complete \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG"
+
+          echo "Vulnerability findings:"
+
+          aws ecr describe-image-scan-findings \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG" \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output table
+
+          CRITICAL="$(
+            aws ecr describe-image-scan-findings \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-id imageTag="$IMAGE_TAG" \
+              --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+              --output text
+          )"
+
+          if [ "$CRITICAL" != "None" ] && [ "${CRITICAL:-0}" -gt 0 ]; then
+            echo "Deployment blocked: ECR found $CRITICAL critical vulnerabilities."
+            exit 1
+          fi
+
+          echo "ECR critical-vulnerability gate passed."
 
       - name: Render ECS task definition
         id: task-definition
@@ -55,9 +122,9 @@ jobs:
         with:
           task-definition-family: ${{ env.ECS_TASK_FAMILY }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}-${{ github.run_id }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
           environment-variables: |
-            APP_VERSION=${{ github.sha }}
+            APP_VERSION=${{ env.RELEASE_SHA }}
 
       - name: Deploy to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -66,3 +133,45 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           service: ${{ env.ECS_SERVICE }}
           wait-for-service-stability: true
+
+      - name: Verify public CareFlow health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESPONSE="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 8 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "${{ vars.CAREFLOW_PUBLIC_URL }}/health/ready"
+          )"
+
+          echo "$RESPONSE"
+          echo "Public CareFlow health check passed."
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          {
+            echo "# CareFlow Deployment"
+            echo
+            echo "✅ GitHub OIDC authentication"
+            echo
+            echo "✅ Container image published to Amazon ECR"
+            echo
+            echo "✅ ECR vulnerability scan completed"
+            echo
+            echo "✅ ECS task definition rendered"
+            echo
+            echo "✅ ECS service reached stable state"
+            echo
+            echo "✅ Public CloudFront health check passed"
+            echo
+            echo "**Release:** \`${RELEASE_SHA}\`"
+            echo
+            echo "**Image:** \`${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${RELEASE_SHA}-${{ github.run_id }}-${{ github.run_attempt }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

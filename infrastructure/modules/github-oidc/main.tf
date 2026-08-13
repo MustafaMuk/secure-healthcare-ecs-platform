@@ -46,51 +46,11 @@ data "aws_iam_policy_document" "github_assume_role" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
 
       values = [
-        replace(
-          var.github_subject,
-          ":ref:${var.github_ref}",
-          ":*"
-        )
-      ]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:repository"
-
-      values = [
-        var.github_repository
-      ]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:repository_id"
-
-      values = [
-        var.github_repository_id
-      ]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:repository_owner_id"
-
-      values = [
-        var.github_repository_owner_id
-      ]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:ref"
-
-      values = [
-        var.github_ref
+        var.github_subject
       ]
     }
   }

@@ -5,7 +5,7 @@ module "github_oidc" {
   environment  = var.environment
 
   github_subject = (
-    "repo:MustafaMuk@1904111277/secure-healthcare-ecs-platform@1324415864:ref:refs/heads/main"
+    "repo:MustafaMuk@190411277/secure-healthcare-ecs-platform@1324415864:ref:refs/heads/main"
   )
 
   github_repository = (
@@ -13,7 +13,7 @@ module "github_oidc" {
   )
 
   github_repository_id       = "1324415864"
-  github_repository_owner_id = "1904111277"
+  github_repository_owner_id = "190411277"
   github_ref                 = "refs/heads/main"
 
   ecr_repository_arn = (

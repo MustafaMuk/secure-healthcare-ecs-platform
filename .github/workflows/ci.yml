@@ -17,8 +17,8 @@ concurrency:
 jobs:
   test-build-and-scan:
     name: Test, build and validate
-
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       postgres:
@@ -33,8 +33,7 @@ jobs:
           - 5432:5432
 
         options: >-
-          --health-cmd
-          "pg_isready -U careflow -d careflow"
+          --health-cmd "pg_isready -U careflow -d careflow"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -44,10 +43,11 @@ jobs:
       PORT: 3100
       APP_VERSION: ci-${{ github.sha }}
       DATABASE_URL: postgresql://careflow:careflow_ci@127.0.0.1:5432/careflow
+      CI_IMAGE: careflow-api:${{ github.sha }}
 
     steps:
       - name: Check out source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Configure Node.js
         uses: actions/setup-node@v6
@@ -75,24 +75,40 @@ jobs:
       - name: Run end-to-end smoke test
         run: ./scripts/smoke-test.sh
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Build hardened container image
-        working-directory: application
-        run: |
-          docker build \
-            --tag "careflow-api:${GITHUB_SHA}" \
-            .
+        uses: docker/build-push-action@v7
+        with:
+          context: ./application
+          load: true
+          push: false
+          tags: ${{ env.CI_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Inspect container image
-        run: |
-          docker image inspect \
-            "careflow-api:${GITHUB_SHA}" \
-            --format \
-            'Image={{.RepoTags}} Size={{.Size}} User={{.Config.User}}'
+      - name: Scan container image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.CI_IMAGE }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
 
-          IMAGE_USER=$(
+      - name: Verify non-root container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_USER="$(
             docker image inspect \
-              "careflow-api:${GITHUB_SHA}" \
+              "$CI_IMAGE" \
               --format '{{.Config.User}}'
-          )
+          )"
 
-          test "${IMAGE_USER}" = "node"
+          echo "Configured container user: $IMAGE_USER"
+
+          test "$IMAGE_USER" = "node"

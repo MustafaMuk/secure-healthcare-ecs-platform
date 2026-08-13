@@ -29,7 +29,7 @@ env:
 
 jobs:
   deploy:
-    name: Build, scan and deploy to ECS
+    name: Build and deploy to ECS
 
     if: >-
       (
@@ -49,22 +49,23 @@ jobs:
 
     env:
       RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      IMAGE_TAG: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
-      - name: Checkout tested source
-        uses: actions/checkout@v6
+      - name: Check out tested source
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_SHA }}
 
       - name: Authenticate to AWS using OIDC
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: CareFlow-${{ github.run_id }}
           allowed-account-ids: 943939515134
 
-      - name: Login to Amazon ECR
+      - name: Log in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -76,53 +77,17 @@ jobs:
         with:
           context: ./application
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Check ECR vulnerability scan
-        shell: bash
-        env:
-          IMAGE_TAG: ${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-
-          echo "Waiting for Amazon ECR image scan..."
-
-          aws ecr wait image-scan-complete \
-            --repository-name "$ECR_REPOSITORY" \
-            --image-id imageTag="$IMAGE_TAG"
-
-          echo "Vulnerability findings:"
-
-          aws ecr describe-image-scan-findings \
-            --repository-name "$ECR_REPOSITORY" \
-            --image-id imageTag="$IMAGE_TAG" \
-            --query 'imageScanFindings.findingSeverityCounts' \
-            --output table
-
-          CRITICAL="$(
-            aws ecr describe-image-scan-findings \
-              --repository-name "$ECR_REPOSITORY" \
-              --image-id imageTag="$IMAGE_TAG" \
-              --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
-              --output text
-          )"
-
-          if [ "$CRITICAL" != "None" ] && [ "${CRITICAL:-0}" -gt 0 ]; then
-            echo "Deployment blocked: ECR found $CRITICAL critical vulnerabilities."
-            exit 1
-          fi
-
-          echo "ECR critical-vulnerability gate passed."
-
       - name: Render ECS task definition
         id: task-definition
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@v1.8.5
         with:
           task-definition-family: ${{ env.ECS_TASK_FAMILY }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
           environment-variables: |
             APP_VERSION=${{ env.RELEASE_SHA }}
 
@@ -153,25 +118,23 @@ jobs:
           echo "$RESPONSE"
           echo "Public CareFlow health check passed."
 
-      - name: Deployment summary
+      - name: Publish deployment summary
         shell: bash
         run: |
           {
             echo "# CareFlow Deployment"
             echo
-            echo "✅ GitHub OIDC authentication"
+            echo "AWS authentication: OIDC"
             echo
-            echo "✅ Container image published to Amazon ECR"
+            echo "Container registry: Amazon ECR"
             echo
-            echo "✅ ECR vulnerability scan completed"
+            echo "Deployment target: Amazon ECS Fargate"
             echo
-            echo "✅ ECS task definition rendered"
+            echo "Service status: stable"
             echo
-            echo "✅ ECS service reached stable state"
-            echo
-            echo "✅ Public CloudFront health check passed"
+            echo "Public health check: passed"
             echo
             echo "**Release:** \`${RELEASE_SHA}\`"
             echo
-            echo "**Image:** \`${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${RELEASE_SHA}-${{ github.run_id }}-${{ github.run_attempt }}\`"
+            echo "**Image:** \`${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${IMAGE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"

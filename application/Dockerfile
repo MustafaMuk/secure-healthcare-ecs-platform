@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:24.18.0-alpine3.23 AS build
+FROM node:24.18.1-alpine3.23 AS build
 
 WORKDIR /app
 
@@ -10,17 +10,29 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 
-RUN DATABASE_URL="postgresql://careflow:careflow_test@127.0.0.1:5432/careflow" DB_SSL=false npm test
+RUN DATABASE_URL="postgresql://careflow:careflow_test@127.0.0.1:5432/careflow" \
+    DB_SSL=false \
+    npm test
+
 RUN npm run build
 RUN npm prune --omit=dev
 
 
-FROM node:24.18.0-alpine3.23 AS runtime
+FROM alpine:3.23 AS runtime
 
 ENV NODE_ENV=production
 ENV PORT=3000
 
 WORKDIR /app
+
+RUN apk add --no-cache \
+      dumb-init \
+      libstdc++ \
+    && addgroup -g 1000 node \
+    && adduser -u 1000 -G node -s /bin/sh -D node \
+    && chown node:node /app
+
+COPY --from=build /usr/local/bin/node /usr/local/bin/node
 
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
@@ -38,5 +50,7 @@ HEALTHCHECK \
   --start-period=20s \
   --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/health/ready').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+ENTRYPOINT ["dumb-init", "--"]
 
 CMD ["node", "dist/server.js"]
